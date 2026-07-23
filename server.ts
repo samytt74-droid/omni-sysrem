@@ -1,14 +1,40 @@
+import express from "express";
 import path from "node:path";
+import app from "./artifacts/api-server/src/app.js";
 
-// Set production environment variables
-process.env.NODE_ENV = "production";
-// Set the port to 3000 (which is the only port accessible from the outside)
-process.env.PORT = process.env.PORT ?? "3000";
-// Set the path to the compiled frontend static files
-process.env.FRONTEND_DIST = path.resolve("artifacts/pos-system/dist/public");
+const PORT = Number(process.env.PORT ?? "3000");
 
-console.log(`Starting production server on port ${process.env.PORT}...`);
-console.log(`Serving frontend from: ${process.env.FRONTEND_DIST}`);
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+      configFile: path.resolve(process.cwd(), "artifacts/pos-system/vite.config.ts"),
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(process.cwd(), "artifacts/pos-system/dist/public");
+    process.env.FRONTEND_DIST = distPath;
+    app.use(express.static(distPath));
+    app.get("*", (req, res, next) => {
+      if (req.path.startsWith("/api")) {
+        res.sendStatus(404);
+        return;
+      }
+      res.sendFile(path.join(distPath, "index.html"), (err) => {
+        if (err) next(err);
+      });
+    });
+  }
 
-// Dynamically import the compiled Express API server entry point
-await import("./artifacts/api-server/dist/index.mjs");
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 OmniSystem POS Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
+});
+

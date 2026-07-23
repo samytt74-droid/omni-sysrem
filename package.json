@@ -5,9 +5,9 @@
   "type": "module",
   "main": "electron-main.cjs",
   "scripts": {
-    "dev": "tsx server-runner.ts",
-    "build": "node artifacts/api-server/build.mjs && vite build --config artifacts/pos-system/vite.config.ts",
-    "start": "node server.ts",
+    "dev": "tsx server.ts",
+    "build": "vite build --config artifacts/pos-system/vite.config.ts && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "start": "node dist/server.cjs",
     "typecheck": "tsc --noEmit -p artifacts/pos-system/tsconfig.json",
     "lint": "tsc --noEmit -p artifacts/pos-system/tsconfig.json",
     "build:electron": "esbuild artifacts/pos-system/src/main/main.js --bundle --platform=node --format=cjs --packages=external --outfile=electron-main.cjs && esbuild artifacts/pos-system/src/main/preload.js --bundle --platform=node --format=cjs --packages=external --outfile=preload.cjs",

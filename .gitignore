@@ -4,6 +4,9 @@ dist/
 dist-desktop/
 *.sqlite
 *.db
+*.db-wal
+*.db-shm
+*.tsbuildinfo
 coverage/
 .DS_Store
 *.log
