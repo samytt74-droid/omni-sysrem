@@ -1,7 +1,5 @@
 import { Router } from "express";
-import { db } from "@workspace/db";
-import { licensesTable, licenseActivationsTable, licenseLogsTable } from "@workspace/db";
-import { eq, desc } from "drizzle-orm";
+import { db } from "../lib/sqlite";
 
 const router = Router();
 
@@ -11,14 +9,6 @@ function isAdmin(req: { headers: Record<string, string | string[] | undefined> }
   return req.headers["x-dev-key"] === DEV_KEY;
 }
 
-function requireAdmin(res: { status: (code: number) => { json: (body: unknown) => void } }, next: () => void, req: Parameters<typeof isAdmin>[0]) {
-  if (!isAdmin(req)) {
-    res.status(403).json({ error: "Unauthorized" });
-    return;
-  }
-  next();
-}
-
 function generateLicenseKey(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const seg = () => Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
@@ -26,7 +16,16 @@ function generateLicenseKey(): string {
 }
 
 function addLog(licenseId: number, action: string, user: string, details?: string) {
-  return db.insert(licenseLogsTable).values({ licenseId, action, user, details });
+  try {
+    db.prepare("INSERT INTO license_logs (license_id, action, user, details) VALUES (?, ?, ?, ?)").run(
+      licenseId,
+      action,
+      user,
+      details ?? ""
+    );
+  } catch (e) {
+    console.error("Error logging license action:", e);
+  }
 }
 
 function calcExpire(type: string, start: Date): Date | null {
@@ -45,14 +44,14 @@ function calcExpire(type: string, start: Date): Date | null {
 router.get("/licenses", async (req, res) => {
   if (!isAdmin(req)) return void res.status(403).json({ error: "Unauthorized" });
   try {
-    const rows = await db.select().from(licensesTable).orderBy(desc(licensesTable.createdDate));
-    const result = await Promise.all(rows.map(async (lic) => {
-      const activations = await db.select().from(licenseActivationsTable).where(eq(licenseActivationsTable.licenseId, lic.id));
+    const rows = db.prepare("SELECT * FROM licenses ORDER BY created_date DESC").all() as any[];
+    const result = rows.map((lic) => {
+      const activations = db.prepare("SELECT * FROM license_activations WHERE license_id = ?").all(lic.id);
       return { ...lic, activationCount: activations.length, activations };
-    }));
+    });
     res.json(result);
-  } catch (err) {
-    req.log.error(err);
+  } catch (err: any) {
+    req.log?.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -62,13 +61,13 @@ router.get("/licenses/:id", async (req, res) => {
   if (!isAdmin(req)) return void res.status(403).json({ error: "Unauthorized" });
   try {
     const id = Number(req.params.id);
-    const [lic] = await db.select().from(licensesTable).where(eq(licensesTable.id, id));
+    const lic = db.prepare("SELECT * FROM licenses WHERE id = ?").get(id) as any;
     if (!lic) return void res.status(404).json({ error: "Not found" });
-    const activations = await db.select().from(licenseActivationsTable).where(eq(licenseActivationsTable.licenseId, id));
-    const logs = await db.select().from(licenseLogsTable).where(eq(licenseLogsTable.licenseId, id)).orderBy(desc(licenseLogsTable.date));
+    const activations = db.prepare("SELECT * FROM license_activations WHERE license_id = ?").all(id);
+    const logs = db.prepare("SELECT * FROM license_logs WHERE license_id = ? ORDER BY created_at DESC").all(id);
     res.json({ ...lic, activations, logs });
-  } catch (err) {
-    req.log.error(err);
+  } catch (err: any) {
+    req.log?.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -82,67 +81,51 @@ router.post("/licenses", async (req, res) => {
     const licenseKey = generateLicenseKey();
     const startDate = new Date();
     const expireDate = calcExpire(licenseType, startDate);
-    const [lic] = await db.insert(licensesTable).values({
-      licenseKey,
-      customerId,
-      companyName,
-      licenseType,
-      startDate,
-      expireDate,
-      status: "pending",
-      branchLimit: branchLimit ?? 1,
-      userLimit: userLimit ?? 5,
-      posLimit: posLimit ?? 1,
-      notes,
-    }).returning();
-    await addLog(lic.id, "created", "developer", `نوع الترخيص: ${licenseType}`);
+    const expireStr = expireDate ? expireDate.toISOString() : null;
+
+    const stmt = db.prepare(`
+      INSERT INTO licenses (license_key, client_name, type, status, max_devices, expire_date)
+      VALUES (?, ?, ?, 'pending', ?, ?)
+    `);
+    const info = stmt.run(licenseKey, companyName, licenseType, posLimit ?? 1, expireStr);
+    const licId = Number(info.lastInsertRowid);
+    const lic = db.prepare("SELECT * FROM licenses WHERE id = ?").get(licId);
+
+    addLog(licId, "created", "developer", `نوع الترخيص: ${licenseType}`);
     res.status(201).json(lic);
-  } catch (err) {
-    req.log.error(err);
+  } catch (err: any) {
+    req.log?.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-/* ── ADMIN: update license (renew, activate, suspend, transfer) ── */
+/* ── ADMIN: update license ── */
 router.patch("/licenses/:id", async (req, res) => {
   if (!isAdmin(req)) return void res.status(403).json({ error: "Unauthorized" });
   try {
     const id = Number(req.params.id);
-    const { status, companyName, branchLimit, userLimit, posLimit, notes, licenseType, renewMonths, machineId } = req.body;
-    const [existing] = await db.select().from(licensesTable).where(eq(licensesTable.id, id));
+    const { status, companyName, machineId } = req.body;
+    const existing = db.prepare("SELECT * FROM licenses WHERE id = ?").get(id) as any;
     if (!existing) return void res.status(404).json({ error: "Not found" });
 
-    const updates: Partial<typeof existing> = {};
-    if (status) updates.status = status;
-    if (companyName) updates.companyName = companyName;
-    if (branchLimit !== undefined) updates.branchLimit = branchLimit;
-    if (userLimit !== undefined) updates.userLimit = userLimit;
-    if (posLimit !== undefined) updates.posLimit = posLimit;
-    if (notes !== undefined) updates.notes = notes;
-    if (licenseType) {
-      updates.licenseType = licenseType;
-      const base = new Date();
-      updates.expireDate = calcExpire(licenseType, base) ?? undefined;
+    if (status) {
+      db.prepare("UPDATE licenses SET status = ? WHERE id = ?").run(status, id);
     }
-    if (renewMonths) {
-      const base = existing.expireDate && existing.expireDate > new Date() ? existing.expireDate : new Date();
-      const d = new Date(base);
-      d.setMonth(d.getMonth() + Number(renewMonths));
-      updates.expireDate = d;
+    if (companyName) {
+      db.prepare("UPDATE licenses SET client_name = ? WHERE id = ?").run(companyName, id);
     }
     if (machineId !== undefined) {
-      updates.machineId = machineId;
+      db.prepare("UPDATE licenses SET machine_id = ? WHERE id = ?").run(machineId, id);
       if (machineId === null) {
-        await db.delete(licenseActivationsTable).where(eq(licenseActivationsTable.licenseId, id));
+        db.prepare("DELETE FROM license_activations WHERE license_id = ?").run(id);
       }
     }
 
-    const [updated] = await db.update(licensesTable).set(updates).where(eq(licensesTable.id, id)).returning();
-    const action = status === "active" ? "activated" : status === "suspended" ? "suspended" : renewMonths ? "renewed" : machineId === null ? "transferred" : "updated";
-    await addLog(id, action, "developer", JSON.stringify(updates));
+    const updated = db.prepare("SELECT * FROM licenses WHERE id = ?").get(id);
+    addLog(id, status === "active" ? "activated" : "updated", "developer", JSON.stringify(req.body));
     res.json(updated);
-  } catch (err) {
-    req.log.error(err);
+  } catch (err: any) {
+    req.log?.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -152,12 +135,12 @@ router.delete("/licenses/:id", async (req, res) => {
   if (!isAdmin(req)) return void res.status(403).json({ error: "Unauthorized" });
   try {
     const id = Number(req.params.id);
-    await db.delete(licenseActivationsTable).where(eq(licenseActivationsTable.licenseId, id));
-    await db.delete(licenseLogsTable).where(eq(licenseLogsTable.licenseId, id));
-    await db.delete(licensesTable).where(eq(licensesTable.id, id));
+    db.prepare("DELETE FROM license_activations WHERE license_id = ?").run(id);
+    db.prepare("DELETE FROM license_logs WHERE license_id = ?").run(id);
+    db.prepare("DELETE FROM licenses WHERE id = ?").run(id);
     res.json({ ok: true });
-  } catch (err) {
-    req.log.error(err);
+  } catch (err: any) {
+    req.log?.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -168,42 +151,32 @@ router.post("/license/activate", async (req, res) => {
     const { licenseKey, machineId } = req.body;
     if (!licenseKey || !machineId) return void res.status(400).json({ error: "licenseKey and machineId required" });
 
-    const [lic] = await db.select().from(licensesTable).where(eq(licensesTable.licenseKey, licenseKey));
+    const lic = db.prepare("SELECT * FROM licenses WHERE license_key = ?").get(licenseKey) as any;
     if (!lic) return void res.status(404).json({ error: "license_not_found", message: "مفتاح الترخيص غير صحيح" });
     if (lic.status === "suspended") return void res.status(403).json({ error: "license_suspended", message: "الترخيص موقوف" });
-    if (lic.expireDate && lic.expireDate < new Date()) return void res.status(403).json({ error: "license_expired", message: "انتهت صلاحية الترخيص" });
-    if (lic.machineId && lic.machineId !== machineId) return void res.status(403).json({ error: "machine_mismatch", message: "الترخيص مرتبط بجهاز آخر" });
+    if (lic.expire_date && new Date(lic.expire_date) < new Date()) return void res.status(403).json({ error: "license_expired", message: "انتهت صلاحية الترخيص" });
+    if (lic.machine_id && lic.machine_id !== machineId) return void res.status(403).json({ error: "machine_mismatch", message: "الترخيص مرتبط بجهاز آخر" });
 
-    const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0] ?? req.socket?.remoteAddress ?? "";
-
-    if (!lic.machineId) {
-      await db.update(licensesTable).set({ machineId, status: "active" }).where(eq(licensesTable.id, lic.id));
-      await db.insert(licenseActivationsTable).values({ licenseId: lic.id, machineId, ipAddress: ip });
-      await addLog(lic.id, "activated", machineId, `IP: ${ip}`);
-    } else {
-      const [existingAct] = await db.select().from(licenseActivationsTable).where(eq(licenseActivationsTable.licenseId, lic.id));
-      if (existingAct) {
-        await db.update(licenseActivationsTable).set({ lastSeen: new Date(), ipAddress: ip }).where(eq(licenseActivationsTable.id, existingAct.id));
-      }
+    if (!lic.machine_id) {
+      db.prepare("UPDATE licenses SET machine_id = ?, status = 'active' WHERE id = ?").run(machineId, lic.id);
+      db.prepare("INSERT INTO license_activations (license_id, machine_id) VALUES (?, ?)").run(lic.id, machineId);
+      addLog(lic.id, "activated", machineId, "Activation completed");
     }
 
-    const [refreshed] = await db.select().from(licensesTable).where(eq(licensesTable.id, lic.id));
+    const refreshed = db.prepare("SELECT * FROM licenses WHERE id = ?").get(lic.id) as any;
     res.json({
       ok: true,
       license: {
-        licenseKey: refreshed.licenseKey,
-        companyName: refreshed.companyName,
-        licenseType: refreshed.licenseType,
+        licenseKey: refreshed.license_key,
+        companyName: refreshed.client_name,
+        licenseType: refreshed.type,
         status: refreshed.status,
-        expireDate: refreshed.expireDate,
-        branchLimit: refreshed.branchLimit,
-        userLimit: refreshed.userLimit,
-        posLimit: refreshed.posLimit,
-        machineId: refreshed.machineId,
+        expireDate: refreshed.expire_date,
+        machineId: refreshed.machine_id,
       },
     });
-  } catch (err) {
-    req.log.error(err);
+  } catch (err: any) {
+    req.log?.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -214,40 +187,24 @@ router.post("/license/verify", async (req, res) => {
     const { licenseKey, machineId } = req.body;
     if (!licenseKey || !machineId) return void res.status(400).json({ valid: false, error: "missing_params" });
 
-    const [lic] = await db.select().from(licensesTable).where(eq(licensesTable.licenseKey, licenseKey));
+    const lic = db.prepare("SELECT * FROM licenses WHERE license_key = ?").get(licenseKey) as any;
     if (!lic) return void res.json({ valid: false, error: "license_not_found" });
     if (lic.status === "suspended") return void res.json({ valid: false, error: "license_suspended" });
     if (lic.status === "pending") return void res.json({ valid: false, error: "license_pending" });
-    if (lic.machineId && lic.machineId !== machineId) return void res.json({ valid: false, error: "machine_mismatch" });
-    if (lic.expireDate && lic.expireDate < new Date()) {
-      await db.update(licensesTable).set({ status: "expired" }).where(eq(licensesTable.id, lic.id));
-      return void res.json({ valid: false, error: "license_expired" });
-    }
-
-    const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0] ?? req.socket?.remoteAddress ?? "";
-    const [act] = await db.select().from(licenseActivationsTable).where(eq(licenseActivationsTable.licenseId, lic.id));
-    if (act) {
-      await db.update(licenseActivationsTable).set({ lastSeen: new Date(), ipAddress: ip }).where(eq(licenseActivationsTable.id, act.id));
-    }
-
-    const daysLeft = lic.expireDate ? Math.ceil((lic.expireDate.getTime() - Date.now()) / 86400000) : null;
+    if (lic.machine_id && lic.machine_id !== machineId) return void res.json({ valid: false, error: "machine_mismatch" });
 
     res.json({
       valid: true,
       license: {
-        licenseKey: lic.licenseKey,
-        companyName: lic.companyName,
-        licenseType: lic.licenseType,
+        licenseKey: lic.license_key,
+        companyName: lic.client_name,
+        licenseType: lic.type,
         status: lic.status,
-        expireDate: lic.expireDate,
-        branchLimit: lic.branchLimit,
-        userLimit: lic.userLimit,
-        posLimit: lic.posLimit,
-        daysLeft,
+        expireDate: lic.expire_date,
       },
     });
-  } catch (err) {
-    req.log.error(err);
+  } catch (err: any) {
+    req.log?.error(err);
     res.status(500).json({ valid: false, error: "server_error" });
   }
 });
