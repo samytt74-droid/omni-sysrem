@@ -10,7 +10,7 @@
     "start": "node dist/server.cjs",
     "typecheck": "tsc --noEmit -p artifacts/pos-system/tsconfig.json",
     "lint": "tsc --noEmit -p artifacts/pos-system/tsconfig.json",
-    "build:electron": "esbuild artifacts/pos-system/src/main/main.js --bundle --platform=node --format=cjs --external:electron --external:better-sqlite3 --alias:@workspace/api-client-react=./artifacts/pos-system/src/backend/lib/api-client-react/src/index.ts --alias:@workspace/api-zod=./artifacts/pos-system/src/backend/lib/api-zod/src/index.ts --outfile=electron-main.cjs && esbuild artifacts/pos-system/src/main/preload.js --bundle --platform=node --format=cjs --external:electron --outfile=preload.cjs",
+    "build:electron": "esbuild artifacts/pos-system/src/main/main.js --bundle --platform=node --format=cjs --external:electron --external:node:sqlite --alias:@workspace/api-client-react=./artifacts/pos-system/src/backend/lib/api-client-react/src/index.ts --alias:@workspace/api-zod=./artifacts/pos-system/src/backend/lib/api-zod/src/index.ts --outfile=electron-main.cjs && esbuild artifacts/pos-system/src/main/preload.js --bundle --platform=node --format=cjs --external:electron --outfile=preload.cjs",
     "rebuild": "electron-rebuild",
     "electron:run": "npm run build && npm run build:electron && electron electron-main.cjs",
     "electron:package": "npm run build && npm run build:electron && electron-packager . \"Restaurant_POS\" --overwrite --out=dist-desktop"

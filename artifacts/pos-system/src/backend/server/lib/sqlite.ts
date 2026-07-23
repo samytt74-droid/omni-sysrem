@@ -1,6 +1,23 @@
-import Database from "better-sqlite3";
 import path from "node:path";
 import { scryptSync, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdirSync } from "node:fs";
+
+let DatabaseEngine: any;
+let isNodeSqlite = false;
+
+try {
+  // Try built-in node:sqlite (available in Node.js 22+ & Electron)
+  const sqliteModule = require("node:sqlite");
+  DatabaseEngine = sqliteModule.DatabaseSync;
+  isNodeSqlite = true;
+} catch {
+  try {
+    DatabaseEngine = require("better-sqlite3");
+  } catch {
+    console.error("No SQLite engine found!");
+    throw new Error("Could not initialize SQLite database");
+  }
+}
 
 const workspaceRoot = process.cwd().endsWith(path.join("artifacts", "api-server"))
   ? path.resolve(process.cwd(), "../..")
@@ -10,10 +27,68 @@ const dbPath = process.env.OMNISYSTEM_DB_PATH
   ? path.resolve(process.env.OMNISYSTEM_DB_PATH)
   : path.resolve(workspaceRoot, "artifacts/api-server/data/pos.db");
 
-import { mkdirSync } from "node:fs";
 mkdirSync(path.dirname(dbPath), { recursive: true });
 
-export const db = new Database(dbPath);
+class DatabaseWrapper {
+  private rawDb: any;
+  private isNodeSqlite: boolean;
+
+  constructor(filename: string) {
+    this.isNodeSqlite = isNodeSqlite;
+    this.rawDb = new DatabaseEngine(filename);
+  }
+
+  pragma(sql: string) {
+    if (this.isNodeSqlite) {
+      this.rawDb.exec(`PRAGMA ${sql};`);
+    } else {
+      this.rawDb.pragma(sql);
+    }
+  }
+
+  exec(sql: string) {
+    return this.rawDb.exec(sql);
+  }
+
+  prepare(sql: string) {
+    const stmt = this.rawDb.prepare(sql);
+    return {
+      run: (...params: any[]) => {
+        const res = stmt.run(...params);
+        return {
+          lastInsertRowid: res?.lastInsertRowid,
+          changes: res?.changes,
+        };
+      },
+      get: (...params: any[]) => {
+        return stmt.get(...params);
+      },
+      all: (...params: any[]) => {
+        return stmt.all(...params);
+      },
+    };
+  }
+
+  transaction<T extends (...args: any[]) => any>(fn: T): T {
+    if (!this.isNodeSqlite && typeof this.rawDb.transaction === "function") {
+      return this.rawDb.transaction(fn);
+    }
+    const self = this;
+    return ((...args: any[]) => {
+      self.exec("BEGIN IMMEDIATE");
+      try {
+        const res = fn(...args);
+        self.exec("COMMIT");
+        return res;
+      } catch (err) {
+        self.exec("ROLLBACK");
+        throw err;
+      }
+    }) as T;
+  }
+}
+
+export const db = new DatabaseWrapper(dbPath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 

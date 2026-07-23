@@ -29375,17 +29375,82 @@ function seedData() {
     insertItem.run(orderId, 2, "\u0631\u0632 \u0623\u0628\u064A\u0636", 5, 6500, 32500, catIds[0], "\u0627\u0644\u0645\u0637\u0628\u062E");
   }
 }
-var import_better_sqlite3, import_node_path, import_node_crypto, import_node_fs, workspaceRoot, dbPath, db, sessions;
+var import_node_path, import_node_crypto, import_node_fs, DatabaseEngine, isNodeSqlite, workspaceRoot, dbPath, DatabaseWrapper, db, sessions;
 var init_sqlite = __esm({
   "artifacts/pos-system/src/backend/server/lib/sqlite.ts"() {
-    import_better_sqlite3 = __toESM(require("better-sqlite3"), 1);
     import_node_path = __toESM(require("node:path"), 1);
     import_node_crypto = require("node:crypto");
     import_node_fs = require("node:fs");
+    isNodeSqlite = false;
+    try {
+      const sqliteModule = require("node:sqlite");
+      DatabaseEngine = sqliteModule.DatabaseSync;
+      isNodeSqlite = true;
+    } catch {
+      try {
+        DatabaseEngine = require("better-sqlite3");
+      } catch {
+        console.error("No SQLite engine found!");
+        throw new Error("Could not initialize SQLite database");
+      }
+    }
     workspaceRoot = process.cwd().endsWith(import_node_path.default.join("artifacts", "api-server")) ? import_node_path.default.resolve(process.cwd(), "../..") : process.cwd();
     dbPath = process.env.OMNISYSTEM_DB_PATH ? import_node_path.default.resolve(process.env.OMNISYSTEM_DB_PATH) : import_node_path.default.resolve(workspaceRoot, "artifacts/api-server/data/pos.db");
     (0, import_node_fs.mkdirSync)(import_node_path.default.dirname(dbPath), { recursive: true });
-    db = new import_better_sqlite3.default(dbPath);
+    DatabaseWrapper = class {
+      rawDb;
+      isNodeSqlite;
+      constructor(filename) {
+        this.isNodeSqlite = isNodeSqlite;
+        this.rawDb = new DatabaseEngine(filename);
+      }
+      pragma(sql) {
+        if (this.isNodeSqlite) {
+          this.rawDb.exec(`PRAGMA ${sql};`);
+        } else {
+          this.rawDb.pragma(sql);
+        }
+      }
+      exec(sql) {
+        return this.rawDb.exec(sql);
+      }
+      prepare(sql) {
+        const stmt = this.rawDb.prepare(sql);
+        return {
+          run: (...params) => {
+            const res = stmt.run(...params);
+            return {
+              lastInsertRowid: res?.lastInsertRowid,
+              changes: res?.changes
+            };
+          },
+          get: (...params) => {
+            return stmt.get(...params);
+          },
+          all: (...params) => {
+            return stmt.all(...params);
+          }
+        };
+      }
+      transaction(fn) {
+        if (!this.isNodeSqlite && typeof this.rawDb.transaction === "function") {
+          return this.rawDb.transaction(fn);
+        }
+        const self = this;
+        return ((...args) => {
+          self.exec("BEGIN IMMEDIATE");
+          try {
+            const res = fn(...args);
+            self.exec("COMMIT");
+            return res;
+          } catch (err) {
+            self.exec("ROLLBACK");
+            throw err;
+          }
+        });
+      }
+    };
+    db = new DatabaseWrapper(dbPath);
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     sessions = /* @__PURE__ */ new Map();
